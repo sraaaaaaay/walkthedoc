@@ -243,6 +243,12 @@ func getInvalidMarkdownRefs(line []byte, path string, lineNumber int, results ch
 		go func(ref, sourcePath string, lineNum int) {
 			defer waitGroup.Done()
 
+			// The reference might not have an explicit .md file extension,
+			// so we should try to resolve it to one.
+			if !strings.HasSuffix(sourcePath, ".md"){
+				sourcePath = sourcePath + ".md"
+			}
+
 			absPath := filepath.Join(filepath.Dir(sourcePath), ref)
 			_, statErr := os.Stat(absPath)
 			results <- result{isValid: statErr == nil, link: ref, foundInFile: sourcePath, foundLineNumber: lineNum}
