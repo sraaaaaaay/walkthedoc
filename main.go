@@ -254,7 +254,7 @@ func getLineMarkdownRefs(text []byte) [][]byte {
 	var foundLinks [][]byte
 
 	for {
-		// Cut out the surrounding symbols from the formatting (i.e. [Display][(file-path.md)])
+		// Cut out the surrounding symbols from the formatting (i.e. [Display](file-path.md))
 		_, after, found := bytes.Cut(text, []byte("]("))
 		if !found {
 			break
