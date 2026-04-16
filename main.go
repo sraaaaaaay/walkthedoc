@@ -23,9 +23,14 @@ var (
 			IdleConnTimeout:     10 * time.Second,
 			DisableCompression:  true,
 		}}
-	semaphore = make(chan struct{}, 64)
+	
+	perHostSemaphore   = make(map[string]chan struct{})
+	perHostSemaphoreMu sync.Mutex
+
+	seenUrls   = make(map[string]struct{})
+	seenUrlsMu sync.Mutex
+
 	waitGroup sync.WaitGroup
-	seenUrls  sync.Map
 
 	redAnsi   = 31
 	greenAnsi = 32
@@ -91,12 +96,15 @@ func main() {
 
 			links := readHyperlinks(line)
 			for _, urlBytes := range links {
-				// Just store an empty struct in the map - we don't need
-				// any other information right now
-				url := string(urlBytes)
-				if _, dup := seenUrls.LoadOrStore(url, struct{}{}); dup {
+				// Just store an empty struct in the map, indicating that
+				// the URL has been seen
+				urlStr := string(urlBytes)
+				seenUrlsMu.Lock()
+				if _, seen := seenUrls[urlStr]; seen {
 					continue
 				}
+				seenUrls[urlStr] = struct{}{}
+				seenUrlsMu.Unlock()
 
 				waitGroup.Add(1)
 				go func(url string) {
