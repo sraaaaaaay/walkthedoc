@@ -52,6 +52,7 @@ var (
 	dirFlag       string
 	showAllFlag   bool
 	checkUrlsFlag bool
+	jekyllModeFlag bool
 
 	nonLocalPrefixes = [][]byte{
 		[]byte("http://"),
@@ -75,6 +76,7 @@ func main() {
 	flag.StringVar(&dirFlag, "d", ".", "directory to search")
 	flag.BoolVar(&showAllFlag, "a", false, "print all responses")
 	flag.BoolVar(&checkUrlsFlag, "l", false, "check external URLs")
+	flag.BoolVar(&jekyllModeFlag, "j", false, "(Jekyll mode) - validate that relative links map to existing files")
 	flag.Parse()
 
 	if _, err := os.Stat(dirFlag); err != nil {
@@ -242,16 +244,23 @@ func getInvalidMarkdownRefs(line []byte, path string, lineNumber int, results ch
 		waitGroup.Add(1)
 		go func(ref, sourcePath string, lineNum int) {
 			defer waitGroup.Done()
-
-			// The reference might not have an explicit .md file extension,
-			// so we should try to resolve it to one.
-			if !strings.HasSuffix(sourcePath, ".md"){
-				sourcePath = sourcePath + ".md"
+			// In Jekyll mode, links shouldn't have a .md suffix — Jekyll renders
+			// them as HTML routes. In standard mode, links reference .md files directly
+			mdRef := ref
+			if jekyllModeFlag {
+				switch filepath.Ext(ref) {
+				case ".md":
+					// .md suffix is invalid in Jekyll links
+					results <- result{isValid: false, link: ref, foundInFile: sourcePath, foundLineNumber: lineNum}
+					return
+				case "":
+					// If there's no extension, check that the path still maps to an .md file on disk
+					mdRef = ref + ".md"
+				}
 			}
 
-			absPath := filepath.Join(filepath.Dir(sourcePath), ref)
-			_, statErr := os.Stat(absPath)
-			results <- result{isValid: statErr == nil, link: ref, foundInFile: sourcePath, foundLineNumber: lineNum}
+			_, err := os.Stat(filepath.Join(filepath.Dir(sourcePath), mdRef))
+			results <- result{isValid: err == nil, link: ref, foundInFile: sourcePath, foundLineNumber: lineNum}
 		}(refStr, path, lineNumber)
 	}
 }
@@ -260,7 +269,7 @@ func getLineMarkdownRefs(text []byte) [][]byte {
 	var foundLinks [][]byte
 
 	for {
-		// Cut out the surrounding symbols from the formatting (i.e. [Display](file-path.md))
+		// Cut out the surrounding symbols from the formatting
 		_, after, found := bytes.Cut(text, []byte("]("))
 		if !found {
 			break
