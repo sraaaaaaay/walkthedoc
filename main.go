@@ -158,10 +158,7 @@ func (w *walker) getInvalidUrls(line []byte, path string, lineNumber int, result
 			continue
 		}
 
-		w.validatingLinesDone.Add(1)
-		go func(urlStr, path string, lineNumber int) {
-			defer w.validatingLinesDone.Done()
-
+		w.validatingLinesDone.Go(func() {
 			parsedUrl, parseErr := url.Parse(urlStr)
 			if parseErr != nil {
 				return
@@ -198,7 +195,7 @@ func (w *walker) getInvalidUrls(line []byte, path string, lineNumber int, result
 			}
 			resp.Body.Close()
 			results <- result{isValid: true, link: urlStr, foundInFile: path, foundLineNumber: lineNumber, responseStatusCode: fmt.Sprintf("%d", resp.StatusCode)}
-		}(urlStr, path, lineNumber)
+		})
 	}
 }
 
@@ -232,33 +229,30 @@ func getLineUrls(line []byte) [][]byte {
 func (w *walker) getInvalidMarkdownRefs(line []byte, path string, lineNumber int, results chan<- result) {
 	mdLinks := getLineMarkdownRefs(line)
 	for _, refBytes := range mdLinks {
-
 		refStr := string(refBytes)
 		if !w.markSeen(refStr) {
 			continue
 		}
 
-		w.validatingLinesDone.Add(1)
-		go func(ref, sourcePath string, lineNum int) {
-			defer w.validatingLinesDone.Done()
+		w.validatingLinesDone.Go(func() {
 			// In Jekyll mode, links shouldn't have a .md suffix — Jekyll renders
 			// them as HTML routes. In standard mode, links reference .md files directly
-			mdRef := ref
+			fileToCheck := refStr
 			if jekyllModeFlag {
-				switch filepath.Ext(ref) {
+				switch filepath.Ext(refStr) {
 				case ".md":
 					// .md suffix is invalid in Jekyll links
-					results <- result{isValid: false, link: ref, foundInFile: sourcePath, foundLineNumber: lineNum}
+					results <- result{isValid: false, link: refStr, foundInFile: path, foundLineNumber: lineNumber}
 					return
 				case "":
 					// If there's no extension, check that the path still maps to an .md file on disk
-					mdRef = ref + ".md"
+					fileToCheck = refStr + ".md"
 				}
 			}
 
-			_, err := os.Stat(filepath.Join(filepath.Dir(sourcePath), mdRef))
-			results <- result{isValid: err == nil, link: ref, foundInFile: sourcePath, foundLineNumber: lineNum}
-		}(refStr, path, lineNumber)
+			_, err := os.Stat(filepath.Join(filepath.Dir(path), fileToCheck))
+			results <- result{isValid: err == nil, link: refStr, foundInFile: path, foundLineNumber: lineNumber}
+		})
 	}
 }
 
