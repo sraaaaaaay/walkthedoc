@@ -7,11 +7,16 @@ import (
 	"fmt"
 	"io/fs"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+)
+
+const (
+	maxActiveReqsPerHost = 2
 )
 
 var (
@@ -49,10 +54,8 @@ func init() {
 }
 
 // TODO
-// - Semaphore per-host (stops overloading smaller sites with requests)
-// - Rate limiting (small delay between requests to the same host)
-// - Save successful ones to 24hr cache
-// - Add identifiable user agent for logging
+// - Rate limiting?
+// - Save successful ones to 24hr cache to reduce spam
 func main() {
 	flag.StringVar(&dirFlag, "d", ".", "directory to search")
 	flag.BoolVar(&showAllFlag, "a", false, "print all HTTP responses")
@@ -107,21 +110,47 @@ func main() {
 				seenUrlsMu.Unlock()
 
 				waitGroup.Add(1)
-				go func(url string) {
+				go func(rawUrl string, lineNum int) {
 					defer waitGroup.Done()
 
+					// If needed, set up a semaphore for the hostname - we
+					// don't want to hammer any smaller sites with requests
+					parsedUrl, parseErr := url.Parse(rawUrl)
+					if parseErr != nil {
+						return
+					}
+
+					hostname := parsedUrl.Hostname()
+					perHostSemaphoreMu.Lock()
+					if _, ok := perHostSemaphore[hostname]; !ok {
+						perHostSemaphore[hostname] = make(chan struct{}, maxActiveReqsPerHost)
+					}
+
+					// Capture a "local" of the channel for use within this goroutine
+					sem := perHostSemaphore[hostname]
+					perHostSemaphoreMu.Unlock()
+
 					// The channel is buffered - sending will block
-					// if there are already 64 HEAD requests in progress.
-					semaphore <- struct{}{}
-					defer func() { <-semaphore }()
+					// until the concurrent requests are below the set limit
+					sem <- struct{}{}
+					defer func() { <-sem }()
 
-					response, err := httpClient.Head(string(url))
-
+					req, err := http.NewRequest(http.MethodHead, rawUrl, nil)
 					if err != nil {
-						fmt.Printf("%s %s (%s, line %d)\n", formatSgr("[Invalid]", redAnsi), url, path, lineNumber)
+						return
+					}
+
+					req.Header.Set("User-Agent", "Walk_The_Doc/v1")
+
+					response, reqErr := httpClient.Do(req)
+					if reqErr != nil {
+						fmt.Printf("%s %s (%s, line %d)\n", formatSgr("[Invalid]", redAnsi), rawUrl, path, lineNum)
 					} else {
 						if showAllFlag {
-							fmt.Printf("%s %s\n", formatSgr("["+response.Status+"]", greenAnsi), url)
+							fmt.Printf("%s %s\n", formatSgr("["+response.Status+"]", greenAnsi), rawUrl)
+						}
+					}
+				}(urlStr, lineNumber)
 						}
 					}
 				}(url)
