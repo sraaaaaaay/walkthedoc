@@ -30,6 +30,10 @@ var (
 	redAnsi   = 31
 	greenAnsi = 32
 	urlTable  [256]bool
+
+	dirFlag       string
+	showAllFlag   bool
+	checkUrlsFlag bool
 )
 
 func init() {
@@ -45,11 +49,13 @@ func init() {
 // - Save successful ones to 24hr cache
 // - Add identifiable user agent for logging
 func main() {
-	dirFlag := flag.String("d", ".", "directory to search")
-	showAllFlag := flag.Bool("a", false, "print all HTTP responses")
+	flag.StringVar(&dirFlag, "d", ".", "directory to search")
+	flag.BoolVar(&showAllFlag, "a", false, "print all HTTP responses")
+	flag.BoolVar(&checkUrlsFlag, "l", false, "check external URLs")
+
 	flag.Parse()
 
-	if _, err := os.Stat(*dirFlag); err != nil {
+	if _, err := os.Stat(dirFlag); err != nil {
 		if os.IsNotExist(err) {
 			fmt.Fprintf(os.Stderr, "directory not found\n")
 			os.Exit(1)
@@ -58,7 +64,7 @@ func main() {
 
 	// Traverse the current directory, scanning the contents of any Markdown files.
 	// If a URL (http/https) is found, send a HEAD request to verify a response.
-	filepath.WalkDir(*dirFlag, func(path string, entry fs.DirEntry, err error) error {
+	filepath.WalkDir(dirFlag, func(path string, entry fs.DirEntry, err error) error {
 		if entry.IsDir() {
 			return nil
 		}
@@ -106,7 +112,7 @@ func main() {
 					if err != nil {
 						fmt.Printf("%s %s (%s, line %d)\n", formatSgr("[Invalid]", redAnsi), url, path, lineNumber)
 					} else {
-						if *showAllFlag {
+						if showAllFlag {
 							fmt.Printf("%s %s\n", formatSgr("["+response.Status+"]", greenAnsi), url)
 						}
 					}
