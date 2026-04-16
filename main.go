@@ -28,7 +28,7 @@ var (
 			IdleConnTimeout:     10 * time.Second,
 			DisableCompression:  true,
 		}}
-	
+
 	perHostSemaphore   = make(map[string]chan struct{})
 	perHostSemaphoreMu sync.Mutex
 
@@ -47,7 +47,7 @@ var (
 )
 
 func init() {
-	// Populate a lookup table with bytes for common url terminators (whitespace, brackets, etc)
+	// Populate a lookup table with bytes for common link terminators (whitespace, brackets, etc)
 	for _, c := range []byte(" \t\n\r\"'<>,()") {
 		urlTable[c] = true
 	}
@@ -93,7 +93,7 @@ func main() {
 			lineNumber++
 			line = scanner.Bytes()
 
-			if !isHyperlinkLine(line) {
+			if !containsLink(line) {
 				continue
 			}
 
@@ -151,9 +151,29 @@ func main() {
 						}
 					}
 				}(urlStr, lineNumber)
-						}
+			}
+
+			mdLinks := readMarkdownLinks(line)
+			for _, refBytes := range mdLinks {
+				refStr := string(refBytes)
+				seenUrlsMu.Lock()
+				if _, seen := seenUrls[refStr]; seen {
+					continue
+				}
+				seenUrls[refStr] = struct{}{}
+				seenUrlsMu.Unlock()
+
+				waitGroup.Add(1)
+				go func(ref, sourcePath string, lineNum int) {
+					defer waitGroup.Done()
+
+					absPath := filepath.Join(filepath.Dir(sourcePath), ref)
+					if _, statErr := os.Stat(absPath); statErr != nil {
+						fmt.Printf("%s %s (%s, line %d)\n", formatSgr("[Invalid]", redAnsi), ref, sourcePath, lineNum)
+					} else if showAllFlag {
+						fmt.Printf("%s %s\n", formatSgr("[OK]", greenAnsi), ref)
 					}
-				}(url)
+				}(refStr, path, lineNumber)
 			}
 		}
 
@@ -165,8 +185,45 @@ func main() {
 	waitGroup.Wait()
 }
 
-func isHyperlinkLine(line []byte) bool {
-	return bytes.Contains(line, []byte("http"))
+func readMarkdownLinks(text []byte) [][]byte {
+	links := make([][]byte, 0)
+
+	for {
+		idx := bytes.Index(text, []byte("]("))
+		if idx == -1 {
+			break
+		}
+
+		remaining := text[idx+2:]
+		endIdx := bytes.IndexByte(remaining, ')')
+		if endIdx == -1 {
+			break
+		}
+
+		ref := remaining[:endIdx]
+		text = remaining[endIdx:]
+
+		if len(ref) == 0 ||
+			bytes.HasPrefix(ref, []byte("http://")) ||
+			bytes.HasPrefix(ref, []byte("https://")) ||
+			bytes.HasPrefix(ref, []byte("mailto:")) ||
+			bytes.HasPrefix(ref, []byte("#")) {
+			continue
+		}
+
+		// Remove any fragment (header links etc)
+		if fragIdx := bytes.IndexByte(ref, '#'); fragIdx != -1 {
+			ref = ref[:fragIdx]
+		}
+
+		links = append(links, ref)
+	}
+
+	return links
+}
+
+func containsLink(line []byte) bool {
+	return bytes.Contains(line, []byte("http")) || bytes.Contains(line, []byte("]("))
 }
 
 func readHyperlinks(text []byte) [][]byte {
@@ -197,7 +254,7 @@ func readHyperlinks(text []byte) [][]byte {
 }
 
 func findUrlEnd(s []byte) int {
-	for i := 0; i < len(s); i++ {
+	for i := range s {
 		if urlTable[s[i]] {
 			return i
 		}
