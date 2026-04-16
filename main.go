@@ -52,6 +52,13 @@ var (
 	dirFlag       string
 	showAllFlag   bool
 	checkUrlsFlag bool
+
+	nonLocalPrefixes = [][]byte{
+		[]byte("http://"),
+		[]byte("https://"),
+		[]byte("mailto:"),
+		[]byte("#"),
+	}
 )
 
 func init() {
@@ -66,7 +73,7 @@ func init() {
 // - Save successful ones to 24hr cache to reduce spam
 func main() {
 	flag.StringVar(&dirFlag, "d", ".", "directory to search")
-	flag.BoolVar(&showAllFlag, "a", false, "print all HTTP responses")
+	flag.BoolVar(&showAllFlag, "a", false, "print all responses")
 	flag.BoolVar(&checkUrlsFlag, "l", false, "check external URLs")
 	flag.Parse()
 
@@ -120,7 +127,9 @@ func main() {
 				continue
 			}
 
-			getInvalidUrls(line, path, lineNumber, results)
+			if(checkUrlsFlag){
+				getInvalidUrls(line, path, lineNumber, results)
+			}
 			getInvalidMarkdownRefs(line, path, lineNumber, results)
 		}
 
@@ -242,40 +251,44 @@ func getInvalidMarkdownRefs(line []byte, path string, lineNumber int, results ch
 }
 
 func getLineMarkdownRefs(text []byte) [][]byte {
-	links := make([][]byte, 0)
+	var foundLinks [][]byte
 
 	for {
-		idx := bytes.Index(text, []byte("]("))
-		if idx == -1 {
+		// Cut out the surrounding symbols from the formatting (i.e. [Display][(file-path.md)])
+		_, after, found := bytes.Cut(text, []byte("]("))
+		if !found {
 			break
 		}
 
-		remaining := text[idx+2:]
-		endIdx := bytes.IndexByte(remaining, ')')
-		if endIdx == -1 {
+		ref, after, found := bytes.Cut(after, []byte(")"))
+		if !found {
 			break
 		}
 
-		ref := remaining[:endIdx]
-		text = remaining[endIdx:]
+		text = after
 
-		if len(ref) == 0 ||
-			bytes.HasPrefix(ref, []byte("http://")) ||
-			bytes.HasPrefix(ref, []byte("https://")) ||
-			bytes.HasPrefix(ref, []byte("mailto:")) ||
-			bytes.HasPrefix(ref, []byte("#")) {
+		if isNonLocalRef(ref) {
 			continue
 		}
 
-		// Remove any fragment (header links etc)
-		if fragIdx := bytes.IndexByte(ref, '#'); fragIdx != -1 {
-			ref = ref[:fragIdx]
-		}
-
-		links = append(links, ref)
+		// Remove header links - just check the file.
+		ref, _, _ = bytes.Cut(ref, []byte("#"))
+		foundLinks = append(foundLinks, ref)
 	}
 
-	return links
+	return foundLinks
+}
+
+func isNonLocalRef(ref []byte) bool {
+	if len(ref) == 0 {
+		return true
+	}
+	for _, prefix := range nonLocalPrefixes {
+		if bytes.HasPrefix(ref, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func containsLink(line []byte) bool {
