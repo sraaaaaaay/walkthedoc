@@ -15,6 +15,14 @@ import (
 	"time"
 )
 
+type result struct {
+	isValid  bool
+	link    string
+	foundInFile string
+	foundLineNumber   int
+	responseStatusCode string
+}
+
 const (
 	maxActiveReqsPerHost = 2
 )
@@ -62,14 +70,26 @@ func main() {
 	flag.BoolVar(&checkUrlsFlag, "l", false, "check external URLs")
 	flag.Parse()
 
-	defer waitGroup.Wait()
-
 	if _, err := os.Stat(dirFlag); err != nil {
 		if os.IsNotExist(err) {
 			fmt.Fprintf(os.Stderr, "directory not found\n")
 			os.Exit(1)
 		}
 	}
+
+	// Wait for results to be produced by the directory search and print them out
+	// as they arrive.
+	results := make(chan result, 64)
+	var printerDone sync.WaitGroup
+	printerDone.Go(func() {
+		for r := range results {
+			if !r.isValid {
+				fmt.Printf("%s %s (%s, line %d)\n", formatSgr("[Invalid]", redAnsi), r.link, r.foundInFile, r.foundLineNumber)
+			} else if showAllFlag {
+				fmt.Printf("%s %s\n", formatSgr("["+r.responseStatusCode+"]", greenAnsi), r.link)
+			}
+		}
+	})
 
 	// Traverse the current directory, scanning the contents of any Markdown files.
 	// Check that any references to .md files exist, or if enabled, send a HTTP HEAD
@@ -87,6 +107,7 @@ func main() {
 		if err != nil {
 			return err
 		}
+		defer file.Close()
 
 		scanner := bufio.NewScanner(file)
 		lineNumber := 0
@@ -99,15 +120,19 @@ func main() {
 				continue
 			}
 
-			getInvalidUrls(line, path, lineNumber)
-			getInvalidMarkdownRefs(line, path, lineNumber)
+			getInvalidUrls(line, path, lineNumber, results)
+			getInvalidMarkdownRefs(line, path, lineNumber, results)
 		}
 
 		return nil
 	})
+
+	waitGroup.Wait()
+	close(results)
+	printerDone.Wait()
 }
 
-func getInvalidUrls(line []byte, path string, lineNumber int) {
+func getInvalidUrls(line []byte, path string, lineNumber int, results chan<- result) {
 	links := getLineUrls(line)
 
 	for _, urlBytes := range links {
@@ -123,45 +148,46 @@ func getInvalidUrls(line []byte, path string, lineNumber int) {
 		seenUrlsMu.Unlock()
 
 		waitGroup.Add(1)
-		defer waitGroup.Done()
+		go func(urlStr, path string, lineNumber int) {
+			defer waitGroup.Done()
 
-		parsedUrl, parseErr := url.Parse(urlStr)
-		if parseErr != nil {
-			return
-		}
-
-		// Set up a throttle for the hostname - we don't want to
-		// hammer any smaller sites with concurrent requests
-		hostname := parsedUrl.Hostname()
-		perHostSemaphoreMu.Lock()
-		if _, ok := perHostSemaphore[hostname]; !ok {
-			perHostSemaphore[hostname] = make(chan struct{}, maxActiveReqsPerHost)
-		}
-
-		// Capture a "local" of the channel for use within this goroutine
-		sem := perHostSemaphore[hostname]
-		perHostSemaphoreMu.Unlock()
-
-		// The channel is buffered - sending will block
-		// until the concurrent requests are below the set limit
-		sem <- struct{}{}
-		defer func() { <-sem }()
-
-		req, err := http.NewRequest(http.MethodHead, urlStr, nil)
-		if err != nil {
-			return
-		}
-
-		req.Header.Set("User-Agent", "Walk_The_Doc/v1")
-
-		response, reqErr := httpClient.Do(req)
-		if reqErr != nil {
-			fmt.Printf("%s %s (%s, line %d)\n", formatSgr("[Invalid]", redAnsi), urlStr, path, lineNumber)
-		} else {
-			if showAllFlag {
-				fmt.Printf("%s %s\n", formatSgr("["+response.Status+"]", greenAnsi), urlStr)
+			parsedUrl, parseErr := url.Parse(urlStr)
+			if parseErr != nil {
+				return
 			}
-		}
+
+			// Set up a throttle for the hostname - we don't want to
+			// hammer any smaller sites with concurrent requests
+			hostname := parsedUrl.Hostname()
+			perHostSemaphoreMu.Lock()
+			if _, ok := perHostSemaphore[hostname]; !ok {
+				perHostSemaphore[hostname] = make(chan struct{}, maxActiveReqsPerHost)
+			}
+
+			// Capture a "local" of the channel for use within this goroutine
+			sem := perHostSemaphore[hostname]
+			perHostSemaphoreMu.Unlock()
+
+			// The channel is buffered - sending will block
+			// until the concurrent requests are below the set limit
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			req, err := http.NewRequest(http.MethodHead, urlStr, nil)
+			if err != nil {
+				return
+			}
+
+			req.Header.Set("User-Agent", "Walk_The_Doc/v1")
+
+			resp, reqErr := httpClient.Do(req)
+			if reqErr != nil {
+				results <- result{link: urlStr, foundInFile: path, foundLineNumber: lineNumber}
+				return
+			}
+			resp.Body.Close()
+			results <- result{isValid: true, link: urlStr, foundInFile: path, foundLineNumber: lineNumber, responseStatusCode: fmt.Sprintf("%d", resp.StatusCode)}
+		}(urlStr, path, lineNumber)
 	}
 }
 
@@ -192,7 +218,7 @@ func getLineUrls(line []byte) [][]byte {
 	return links
 }
 
-func getInvalidMarkdownRefs(line []byte, path string, lineNumber int) {
+func getInvalidMarkdownRefs(line []byte, path string, lineNumber int, results chan<- result) {
 	mdLinks := getLineMarkdownRefs(line)
 	for _, refBytes := range mdLinks {
 		refStr := string(refBytes)
@@ -209,11 +235,8 @@ func getInvalidMarkdownRefs(line []byte, path string, lineNumber int) {
 			defer waitGroup.Done()
 
 			absPath := filepath.Join(filepath.Dir(sourcePath), ref)
-			if _, statErr := os.Stat(absPath); statErr != nil {
-				fmt.Printf("%s %s (%s, line %d)\n", formatSgr("[Invalid]", redAnsi), ref, sourcePath, lineNum)
-			} else if showAllFlag {
-				fmt.Printf("%s %s\n", formatSgr("[OK]", greenAnsi), ref)
-			}
+			_, statErr := os.Stat(absPath)
+			results <- result{isValid: statErr == nil, link: ref, foundInFile: sourcePath, foundLineNumber: lineNum}
 		}(refStr, path, lineNumber)
 	}
 }
