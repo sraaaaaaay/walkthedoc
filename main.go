@@ -60,8 +60,9 @@ func main() {
 	flag.StringVar(&dirFlag, "d", ".", "directory to search")
 	flag.BoolVar(&showAllFlag, "a", false, "print all HTTP responses")
 	flag.BoolVar(&checkUrlsFlag, "l", false, "check external URLs")
-
 	flag.Parse()
+
+	defer waitGroup.Wait()
 
 	if _, err := os.Stat(dirFlag); err != nil {
 		if os.IsNotExist(err) {
@@ -71,7 +72,8 @@ func main() {
 	}
 
 	// Traverse the current directory, scanning the contents of any Markdown files.
-	// If a URL (http/https) is found, send a HEAD request to verify a response.
+	// Check that any references to .md files exist, or if enabled, send a HTTP HEAD
+	// to a URL to check it responds.
 	filepath.WalkDir(dirFlag, func(path string, entry fs.DirEntry, err error) error {
 		if entry.IsDir() {
 			return nil
@@ -97,95 +99,126 @@ func main() {
 				continue
 			}
 
-			links := readHyperlinks(line)
-			for _, urlBytes := range links {
-				// Just store an empty struct in the map, indicating that
-				// the URL has been seen
-				urlStr := string(urlBytes)
-				seenUrlsMu.Lock()
-				if _, seen := seenUrls[urlStr]; seen {
-					continue
-				}
-				seenUrls[urlStr] = struct{}{}
-				seenUrlsMu.Unlock()
-
-				waitGroup.Add(1)
-				go func(rawUrl string, lineNum int) {
-					defer waitGroup.Done()
-
-					// If needed, set up a semaphore for the hostname - we
-					// don't want to hammer any smaller sites with requests
-					parsedUrl, parseErr := url.Parse(rawUrl)
-					if parseErr != nil {
-						return
-					}
-
-					hostname := parsedUrl.Hostname()
-					perHostSemaphoreMu.Lock()
-					if _, ok := perHostSemaphore[hostname]; !ok {
-						perHostSemaphore[hostname] = make(chan struct{}, maxActiveReqsPerHost)
-					}
-
-					// Capture a "local" of the channel for use within this goroutine
-					sem := perHostSemaphore[hostname]
-					perHostSemaphoreMu.Unlock()
-
-					// The channel is buffered - sending will block
-					// until the concurrent requests are below the set limit
-					sem <- struct{}{}
-					defer func() { <-sem }()
-
-					req, err := http.NewRequest(http.MethodHead, rawUrl, nil)
-					if err != nil {
-						return
-					}
-
-					req.Header.Set("User-Agent", "Walk_The_Doc/v1")
-
-					response, reqErr := httpClient.Do(req)
-					if reqErr != nil {
-						fmt.Printf("%s %s (%s, line %d)\n", formatSgr("[Invalid]", redAnsi), rawUrl, path, lineNum)
-					} else {
-						if showAllFlag {
-							fmt.Printf("%s %s\n", formatSgr("["+response.Status+"]", greenAnsi), rawUrl)
-						}
-					}
-				}(urlStr, lineNumber)
-			}
-
-			mdLinks := readMarkdownLinks(line)
-			for _, refBytes := range mdLinks {
-				refStr := string(refBytes)
-				seenUrlsMu.Lock()
-				if _, seen := seenUrls[refStr]; seen {
-					continue
-				}
-				seenUrls[refStr] = struct{}{}
-				seenUrlsMu.Unlock()
-
-				waitGroup.Add(1)
-				go func(ref, sourcePath string, lineNum int) {
-					defer waitGroup.Done()
-
-					absPath := filepath.Join(filepath.Dir(sourcePath), ref)
-					if _, statErr := os.Stat(absPath); statErr != nil {
-						fmt.Printf("%s %s (%s, line %d)\n", formatSgr("[Invalid]", redAnsi), ref, sourcePath, lineNum)
-					} else if showAllFlag {
-						fmt.Printf("%s %s\n", formatSgr("[OK]", greenAnsi), ref)
-					}
-				}(refStr, path, lineNumber)
-			}
+			getInvalidUrls(line, path, lineNumber)
+			getInvalidMarkdownRefs(line, path, lineNumber)
 		}
 
 		return nil
 	})
-
-	// Wait for all requests to discovered urls to complete or timeout
-	// before reporting.
-	waitGroup.Wait()
 }
 
-func readMarkdownLinks(text []byte) [][]byte {
+func getInvalidUrls(line []byte, path string, lineNumber int) {
+	links := getLineUrls(line)
+
+	for _, urlBytes := range links {
+
+		// Mark the URL as seen
+		urlStr := string(urlBytes)
+		seenUrlsMu.Lock()
+		if _, seen := seenUrls[urlStr]; seen {
+			seenUrlsMu.Unlock()
+			continue
+		}
+		seenUrls[urlStr] = struct{}{}
+		seenUrlsMu.Unlock()
+
+		waitGroup.Add(1)
+		defer waitGroup.Done()
+
+		parsedUrl, parseErr := url.Parse(urlStr)
+		if parseErr != nil {
+			return
+		}
+
+		// Set up a throttle for the hostname - we don't want to
+		// hammer any smaller sites with concurrent requests
+		hostname := parsedUrl.Hostname()
+		perHostSemaphoreMu.Lock()
+		if _, ok := perHostSemaphore[hostname]; !ok {
+			perHostSemaphore[hostname] = make(chan struct{}, maxActiveReqsPerHost)
+		}
+
+		// Capture a "local" of the channel for use within this goroutine
+		sem := perHostSemaphore[hostname]
+		perHostSemaphoreMu.Unlock()
+
+		// The channel is buffered - sending will block
+		// until the concurrent requests are below the set limit
+		sem <- struct{}{}
+		defer func() { <-sem }()
+
+		req, err := http.NewRequest(http.MethodHead, urlStr, nil)
+		if err != nil {
+			return
+		}
+
+		req.Header.Set("User-Agent", "Walk_The_Doc/v1")
+
+		response, reqErr := httpClient.Do(req)
+		if reqErr != nil {
+			fmt.Printf("%s %s (%s, line %d)\n", formatSgr("[Invalid]", redAnsi), urlStr, path, lineNumber)
+		} else {
+			if showAllFlag {
+				fmt.Printf("%s %s\n", formatSgr("["+response.Status+"]", greenAnsi), urlStr)
+			}
+		}
+	}
+}
+
+func getLineUrls(line []byte) [][]byte {
+	links := make([][]byte, 0)
+
+	// The line might contain multiple hyperlinks, so we need to loop over and trim
+	// the contents down until there's nothing left
+	for {
+		httpIdx := bytes.Index(line, []byte("http://"))
+		httpsIdx := bytes.Index(line, []byte("https://"))
+
+		startIdx := httpsIdx
+		if httpsIdx == -1 || (httpIdx != -1 && httpIdx < httpsIdx) {
+			startIdx = httpIdx
+		}
+
+		if startIdx == -1 {
+			break
+		}
+
+		remaining := line[startIdx:]
+		endIdx := findUrlEnd(remaining)
+		links = append(links, remaining[:endIdx])
+		line = remaining[endIdx:]
+	}
+
+	return links
+}
+
+func getInvalidMarkdownRefs(line []byte, path string, lineNumber int) {
+	mdLinks := getLineMarkdownRefs(line)
+	for _, refBytes := range mdLinks {
+		refStr := string(refBytes)
+		seenUrlsMu.Lock()
+		if _, seen := seenUrls[refStr]; seen {
+			seenUrlsMu.Unlock()
+			continue
+		}
+		seenUrls[refStr] = struct{}{}
+		seenUrlsMu.Unlock()
+
+		waitGroup.Add(1)
+		go func(ref, sourcePath string, lineNum int) {
+			defer waitGroup.Done()
+
+			absPath := filepath.Join(filepath.Dir(sourcePath), ref)
+			if _, statErr := os.Stat(absPath); statErr != nil {
+				fmt.Printf("%s %s (%s, line %d)\n", formatSgr("[Invalid]", redAnsi), ref, sourcePath, lineNum)
+			} else if showAllFlag {
+				fmt.Printf("%s %s\n", formatSgr("[OK]", greenAnsi), ref)
+			}
+		}(refStr, path, lineNumber)
+	}
+}
+
+func getLineMarkdownRefs(text []byte) [][]byte {
 	links := make([][]byte, 0)
 
 	for {
@@ -224,33 +257,6 @@ func readMarkdownLinks(text []byte) [][]byte {
 
 func containsLink(line []byte) bool {
 	return bytes.Contains(line, []byte("http")) || bytes.Contains(line, []byte("]("))
-}
-
-func readHyperlinks(text []byte) [][]byte {
-	links := make([][]byte, 0)
-
-	// The line might contain multiple hyperlinks, so we need to loop over and trim
-	// the contents down until there's nothing left
-	for {
-		httpIdx := bytes.Index(text, []byte("http://"))
-		httpsIdx := bytes.Index(text, []byte("https://"))
-
-		startIdx := httpsIdx
-		if httpsIdx == -1 || (httpIdx != -1 && httpIdx < httpsIdx) {
-			startIdx = httpIdx
-		}
-
-		if startIdx == -1 {
-			break
-		}
-
-		remaining := text[startIdx:]
-		endIdx := findUrlEnd(remaining)
-		links = append(links, remaining[:endIdx])
-		text = remaining[endIdx:]
-	}
-
-	return links
 }
 
 func findUrlEnd(s []byte) int {
