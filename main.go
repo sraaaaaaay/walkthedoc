@@ -15,12 +15,22 @@ import (
 	"time"
 )
 
+type walker struct {
+	httpClient http.Client
+
+	perHostSemaphore    map[string]chan struct{}
+	perHostSemaphoreMu  sync.Mutex
+	seenUrls            map[string]struct{}
+	seenUrlsMu          sync.Mutex
+	validatingLinesDone sync.WaitGroup
+}
+
 type result struct {
-	isValid  bool
-	link    string
-	foundInFile string
-	foundLineNumber   int
+	link               string
+	foundInFile        string
 	responseStatusCode string
+	foundLineNumber    int
+	isValid            bool
 }
 
 const (
@@ -28,30 +38,26 @@ const (
 )
 
 var (
-	httpClient = http.Client{
-		Timeout: 5 * time.Second,
-		Transport: &http.Transport{
-			MaxIdleConns:        200,
-			MaxIdleConnsPerHost: 20,
-			IdleConnTimeout:     10 * time.Second,
-			DisableCompression:  true,
-		}}
-
-	perHostSemaphore   = make(map[string]chan struct{})
-	perHostSemaphoreMu sync.Mutex
-
-	seenUrls   = make(map[string]struct{})
-	seenUrlsMu sync.Mutex
-
-	waitGroup sync.WaitGroup
+	programWalker = walker{
+		httpClient: http.Client{
+			Timeout: 5 * time.Second,
+			Transport: &http.Transport{
+				MaxIdleConns:        200,
+				MaxIdleConnsPerHost: 20,
+				IdleConnTimeout:     10 * time.Second,
+				DisableCompression:  true,
+			}},
+		perHostSemaphore: make(map[string]chan struct{}),
+		seenUrls:         make(map[string]struct{}),
+	}
 
 	redAnsi   = 31
 	greenAnsi = 32
 	urlTable  [256]bool
 
-	dirFlag       string
-	showAllFlag   bool
-	checkUrlsFlag bool
+	dirFlag        string
+	showAllFlag    bool
+	checkUrlsFlag  bool
 	jekyllModeFlag bool
 
 	nonLocalPrefixes = [][]byte{
@@ -129,38 +135,32 @@ func main() {
 				continue
 			}
 
-			if(checkUrlsFlag){
-				getInvalidUrls(line, path, lineNumber, results)
+			if checkUrlsFlag {
+				programWalker.getInvalidUrls(line, path, lineNumber, results)
 			}
-			getInvalidMarkdownRefs(line, path, lineNumber, results)
-		}
 
+			programWalker.getInvalidMarkdownRefs(line, path, lineNumber, results)
+		}
 		return nil
 	})
 
-	waitGroup.Wait()
+	programWalker.validatingLinesDone.Wait()
 	close(results)
 	printerDone.Wait()
 }
 
-func getInvalidUrls(line []byte, path string, lineNumber int, results chan<- result) {
+func (w *walker) getInvalidUrls(line []byte, path string, lineNumber int, results chan<- result) {
 	links := getLineUrls(line)
-
 	for _, urlBytes := range links {
-
 		// Mark the URL as seen
 		urlStr := string(urlBytes)
-		seenUrlsMu.Lock()
-		if _, seen := seenUrls[urlStr]; seen {
-			seenUrlsMu.Unlock()
+		if !w.markSeen(urlStr) {
 			continue
 		}
-		seenUrls[urlStr] = struct{}{}
-		seenUrlsMu.Unlock()
 
-		waitGroup.Add(1)
+		w.validatingLinesDone.Add(1)
 		go func(urlStr, path string, lineNumber int) {
-			defer waitGroup.Done()
+			defer w.validatingLinesDone.Done()
 
 			parsedUrl, parseErr := url.Parse(urlStr)
 			if parseErr != nil {
@@ -170,14 +170,14 @@ func getInvalidUrls(line []byte, path string, lineNumber int, results chan<- res
 			// Set up a throttle for the hostname - we don't want to
 			// hammer any smaller sites with concurrent requests
 			hostname := parsedUrl.Hostname()
-			perHostSemaphoreMu.Lock()
-			if _, ok := perHostSemaphore[hostname]; !ok {
-				perHostSemaphore[hostname] = make(chan struct{}, maxActiveReqsPerHost)
+			w.perHostSemaphoreMu.Lock()
+			if _, ok := w.perHostSemaphore[hostname]; !ok {
+				w.perHostSemaphore[hostname] = make(chan struct{}, maxActiveReqsPerHost)
 			}
 
 			// Capture a "local" of the channel for use within this goroutine
-			sem := perHostSemaphore[hostname]
-			perHostSemaphoreMu.Unlock()
+			sem := w.perHostSemaphore[hostname]
+			w.perHostSemaphoreMu.Unlock()
 
 			// The channel is buffered - sending will block
 			// until the concurrent requests are below the set limit
@@ -191,7 +191,7 @@ func getInvalidUrls(line []byte, path string, lineNumber int, results chan<- res
 
 			req.Header.Set("User-Agent", "Walk_The_Doc/v1")
 
-			resp, reqErr := httpClient.Do(req)
+			resp, reqErr := w.httpClient.Do(req)
 			if reqErr != nil {
 				results <- result{link: urlStr, foundInFile: path, foundLineNumber: lineNumber}
 				return
@@ -229,21 +229,18 @@ func getLineUrls(line []byte) [][]byte {
 	return links
 }
 
-func getInvalidMarkdownRefs(line []byte, path string, lineNumber int, results chan<- result) {
+func (w *walker) getInvalidMarkdownRefs(line []byte, path string, lineNumber int, results chan<- result) {
 	mdLinks := getLineMarkdownRefs(line)
 	for _, refBytes := range mdLinks {
+
 		refStr := string(refBytes)
-		seenUrlsMu.Lock()
-		if _, seen := seenUrls[refStr]; seen {
-			seenUrlsMu.Unlock()
+		if !w.markSeen(refStr) {
 			continue
 		}
-		seenUrls[refStr] = struct{}{}
-		seenUrlsMu.Unlock()
 
-		waitGroup.Add(1)
+		w.validatingLinesDone.Add(1)
 		go func(ref, sourcePath string, lineNum int) {
-			defer waitGroup.Done()
+			defer w.validatingLinesDone.Done()
 			// In Jekyll mode, links shouldn't have a .md suffix — Jekyll renders
 			// them as HTML routes. In standard mode, links reference .md files directly
 			mdRef := ref
@@ -265,12 +262,22 @@ func getInvalidMarkdownRefs(line []byte, path string, lineNumber int, results ch
 	}
 }
 
-func getLineMarkdownRefs(text []byte) [][]byte {
+func (w *walker) markSeen(key string) bool {
+	w.seenUrlsMu.Lock()
+	defer w.seenUrlsMu.Unlock()
+	if _, seen := w.seenUrls[key]; seen {
+		return false
+	}
+	w.seenUrls[key] = struct{}{}
+	return true
+}
+
+func getLineMarkdownRefs(line []byte) [][]byte {
 	var foundLinks [][]byte
 
 	for {
 		// Cut out the surrounding symbols from the formatting
-		_, after, found := bytes.Cut(text, []byte("]("))
+		_, after, found := bytes.Cut(line, []byte("]("))
 		if !found {
 			break
 		}
@@ -280,7 +287,7 @@ func getLineMarkdownRefs(text []byte) [][]byte {
 			break
 		}
 
-		text = after
+		line = after
 
 		if isNonLocalRef(ref) {
 			continue
