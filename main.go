@@ -136,10 +136,10 @@ func main() {
 			}
 
 			if checkUrlsFlag {
-				programWalker.getInvalidUrls(line, path, lineNumber, results)
+				programWalker.processLineUrls(line, path, lineNumber, results)
 			}
 
-			programWalker.getInvalidMarkdownRefs(line, path, lineNumber, results)
+			programWalker.processLineMarkdownRefs(line, path, lineNumber, results)
 		}
 		return nil
 	})
@@ -149,9 +149,9 @@ func main() {
 	printerDone.Wait()
 }
 
-func (w *walker) getInvalidUrls(line []byte, path string, lineNumber int, results chan<- result) {
-	links := getLineUrls(line)
-	for _, urlBytes := range links {
+func (w *walker) processLineUrls(line []byte, path string, lineNumber int, results chan<- result) {
+	urlLinks := getLineUrls(line)
+	for _, urlBytes := range urlLinks {
 		// Mark the URL as seen
 		urlStr := string(urlBytes)
 		if !w.markSeen(urlStr) {
@@ -159,44 +159,48 @@ func (w *walker) getInvalidUrls(line []byte, path string, lineNumber int, result
 		}
 
 		w.validatingLinesDone.Go(func() {
-			parsedUrl, parseErr := url.Parse(urlStr)
-			if parseErr != nil {
-				return
-			}
-
-			// Set up a throttle for the hostname - we don't want to
-			// hammer any smaller sites with concurrent requests
-			hostname := parsedUrl.Hostname()
-			w.perHostSemaphoreMu.Lock()
-			if _, ok := w.perHostSemaphore[hostname]; !ok {
-				w.perHostSemaphore[hostname] = make(chan struct{}, maxActiveReqsPerHost)
-			}
-
-			// Capture a "local" of the channel for use within this goroutine
-			sem := w.perHostSemaphore[hostname]
-			w.perHostSemaphoreMu.Unlock()
-
-			// The channel is buffered - sending will block
-			// until the concurrent requests are below the set limit
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			req, err := http.NewRequest(http.MethodHead, urlStr, nil)
-			if err != nil {
-				return
-			}
-
-			req.Header.Set("User-Agent", "Walk_The_Doc/v1")
-
-			resp, reqErr := w.httpClient.Do(req)
-			if reqErr != nil {
-				results <- result{link: urlStr, foundInFile: path, foundLineNumber: lineNumber}
-				return
-			}
-			resp.Body.Close()
-			results <- result{isValid: true, link: urlStr, foundInFile: path, foundLineNumber: lineNumber, responseStatusCode: fmt.Sprintf("%d", resp.StatusCode)}
+			w.validateUrl(urlStr, path, lineNumber, results)
 		})
 	}
+}
+
+func (w *walker) validateUrl(urlStr, path string, lineNumber int, results chan<- result) {
+	parsedUrl, parseErr := url.Parse(urlStr)
+	if parseErr != nil {
+		return
+	}
+
+	// Set up a throttle for the hostname - we don't want to
+	// hammer any smaller sites with concurrent requests
+	hostname := parsedUrl.Hostname()
+	w.perHostSemaphoreMu.Lock()
+	if _, ok := w.perHostSemaphore[hostname]; !ok {
+		w.perHostSemaphore[hostname] = make(chan struct{}, maxActiveReqsPerHost)
+	}
+
+	// Capture a "local" of the channel for use within this goroutine
+	sem := w.perHostSemaphore[hostname]
+	w.perHostSemaphoreMu.Unlock()
+
+	// The channel is buffered - sending will block
+	// until the concurrent requests are below the set limit
+	sem <- struct{}{}
+	defer func() { <-sem }()
+
+	req, err := http.NewRequest(http.MethodHead, urlStr, nil)
+	if err != nil {
+		return
+	}
+
+	req.Header.Set("User-Agent", "Walk_The_Doc/v1")
+
+	resp, reqErr := w.httpClient.Do(req)
+	if reqErr != nil {
+		results <- result{link: urlStr, foundInFile: path, foundLineNumber: lineNumber}
+		return
+	}
+	resp.Body.Close()
+	results <- result{isValid: true, link: urlStr, foundInFile: path, foundLineNumber: lineNumber, responseStatusCode: fmt.Sprintf("%d", resp.StatusCode)}
 }
 
 func getLineUrls(line []byte) [][]byte {
@@ -226,7 +230,7 @@ func getLineUrls(line []byte) [][]byte {
 	return links
 }
 
-func (w *walker) getInvalidMarkdownRefs(line []byte, path string, lineNumber int, results chan<- result) {
+func (w *walker) processLineMarkdownRefs(line []byte, path string, lineNumber int, results chan<- result) {
 	mdLinks := getLineMarkdownRefs(line)
 	for _, refBytes := range mdLinks {
 		refStr := string(refBytes)
@@ -239,13 +243,10 @@ func (w *walker) getInvalidMarkdownRefs(line []byte, path string, lineNumber int
 			// them as HTML routes. In standard mode, links reference .md files directly
 			fileToCheck := refStr
 			if jekyllModeFlag {
-				switch filepath.Ext(refStr) {
-				case ".md":
-					// .md suffix is invalid in Jekyll links
+				if filepath.Ext(refStr) == ".md" {
 					results <- result{isValid: false, link: refStr, foundInFile: path, foundLineNumber: lineNumber}
 					return
-				case "":
-					// If there's no extension, check that the path still maps to an .md file on disk
+				} else if filepath.Ext(refStr) == "" {
 					fileToCheck = refStr + ".md"
 				}
 			}
