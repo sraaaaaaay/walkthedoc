@@ -34,7 +34,7 @@ type result struct {
 }
 
 const (
-	maxActiveReqsPerHost = 2
+	maxActiveReqsPerHost = 4
 )
 
 var (
@@ -44,7 +44,7 @@ var (
 			Transport: &http.Transport{
 				MaxIdleConns:        200,
 				MaxIdleConnsPerHost: 20,
-				IdleConnTimeout:     10 * time.Second,
+				IdleConnTimeout:     3 * time.Second,
 				DisableCompression:  true,
 			}},
 		perHostSemaphore: make(map[string]chan struct{}),
