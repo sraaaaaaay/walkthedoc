@@ -106,11 +106,9 @@ func main() {
 	flag.BoolVar(&jekyllModeFlag, "j", false, "(Jekyll mode) - validate that relative links map to existing files")
 	flag.Parse()
 
-	if _, err := os.Stat(dirFlag); err != nil {
-		if os.IsNotExist(err) {
-			fmt.Fprintf(os.Stderr, "directory not found\n")
-			os.Exit(1)
-		}
+	if _, err := os.Stat(dirFlag); os.IsNotExist(err) {
+		fmt.Fprintf(os.Stderr, "directory not found\n")
+		os.Exit(1)
 	}
 
 	// Wait for results to be produced by the directory search
@@ -292,42 +290,30 @@ func (w *walker) processLineMarkdownRefs(line []byte, path string, lineNumber in
 		}
 
 		w.validatingLinesDone.Go(func() {
-			fileExtension := filepath.Ext(refStr)
+			ext := filepath.Ext(refStr)
 			fileToCheck := refStr
 			resourceType := unknown
 
-			switch fileExtension {
+			switch ext {
 			case ".md":
 				resourceType = markdownFile
 			case ".png", ".jpg", ".jpeg", ".gif", ".svg":
 				resourceType = imageFile
 			}
 
-			// In Jekyll mode, links shouldn't have a .md suffix as they are turned into
-			// HTML routes. In standard mode, links reference .md files directly
-			if jekyllModeFlag {
-				if fileExtension == ".md" {
-					results <- result{
-						isValid:         false,
-						resourceType:    markdownFile,
-						link:            refStr,
-						foundInFile:     path,
-						foundLineNumber: lineNumber,
-					}
-					return
-				} else if fileExtension == "" {
-					fileToCheck = refStr + ".md"
-					resourceType = markdownFile
-				}
+			if jekyllModeFlag && (ext == "" || ext == ".md") {
+				fileToCheck = refStr + ".md"
+				resourceType = markdownFile
 			}
 
 			_, err := os.Stat(filepath.Join(filepath.Dir(path), fileToCheck))
 			results <- result{
-				resourceType:    resourceType,
-				isValid:         err == nil,
 				link:            refStr,
 				foundInFile:     path,
-				foundLineNumber: lineNumber}
+				foundLineNumber: lineNumber,
+				resourceType:    resourceType,
+				isValid:         err == nil,
+			}
 		})
 	}
 }
