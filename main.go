@@ -12,26 +12,43 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"text/tabwriter"
 	"time"
 )
 
 type walker struct {
 	httpClient http.Client
 
+	resultTypeStats     map[resourceType]stat
 	perHostSemaphore    map[string]chan struct{}
 	perHostSemaphoreMu  sync.Mutex
-	seenUrls            map[string]struct{}
-	seenUrlsMu          sync.Mutex
+	seenResources       map[string]struct{}
+	seenResourcesMu     sync.Mutex
 	validatingLinesDone sync.WaitGroup
 }
 
 type result struct {
-	link               string
-	foundInFile        string
-	responseStatusCode string
-	foundLineNumber    int
-	isValid            bool
+	fmt.Stringer
+
+	link            string
+	foundInFile     string
+	foundLineNumber int
+	resourceType    resourceType
+	isValid         bool
 }
+
+type stat struct {
+	valid, invalid int64
+}
+
+type resourceType uint8
+
+const (
+	unknown resourceType = iota
+	markdownFile
+	imageFile
+	externalUrl
+)
 
 const (
 	maxActiveReqsPerHost = 4
@@ -47,18 +64,21 @@ var (
 				IdleConnTimeout:     3 * time.Second,
 				DisableCompression:  true,
 			}},
+		resultTypeStats:  make(map[resourceType]stat),
 		perHostSemaphore: make(map[string]chan struct{}),
-		seenUrls:         make(map[string]struct{}),
+		seenResources:    make(map[string]struct{}),
 	}
 
 	redAnsi   = 31
 	greenAnsi = 32
+	dimAnsi   = 2
 	urlTable  [256]bool
 
 	dirFlag        string
 	showAllFlag    bool
 	checkUrlsFlag  bool
 	jekyllModeFlag bool
+	quietFlag      bool
 
 	nonLocalPrefixes = [][]byte{
 		[]byte("http://"),
@@ -79,9 +99,10 @@ func init() {
 // - Rate limiting?
 // - Save successful ones to 24hr cache to reduce spam
 func main() {
-	flag.StringVar(&dirFlag, "d", ".", "directory to search")
-	flag.BoolVar(&showAllFlag, "a", false, "print all responses")
-	flag.BoolVar(&checkUrlsFlag, "l", false, "check external URLs")
+	flag.StringVar(&dirFlag, "d", ".", "(Directory) - directory to search")
+	flag.BoolVar(&showAllFlag, "a", false, "(All) - print all responses")
+	flag.BoolVar(&checkUrlsFlag, "l", false, "(Links) - check external URLs")
+	flag.BoolVar(&quietFlag, "q", false, "(Quiet) - print only a table of results")
 	flag.BoolVar(&jekyllModeFlag, "j", false, "(Jekyll mode) - validate that relative links map to existing files")
 	flag.Parse()
 
@@ -92,16 +113,28 @@ func main() {
 		}
 	}
 
-	// Wait for results to be produced by the directory search and print them out
-	// as they arrive.
+	// Wait for results to be produced by the directory search
+	// and print them out as they arrive.
 	results := make(chan result, 64)
 	var printerDone sync.WaitGroup
 	printerDone.Go(func() {
+		currentStat := stat{}
 		for r := range results {
-			if !r.isValid {
-				fmt.Printf("%s %s (%s, line %d)\n", formatSgr("[Invalid]", redAnsi), r.link, r.foundInFile, r.foundLineNumber)
-			} else if showAllFlag {
-				fmt.Printf("%s %s\n", formatSgr("["+r.responseStatusCode+"]", greenAnsi), r.link)
+
+			currentStat = programWalker.resultTypeStats[r.resourceType]
+			if r.isValid {
+				currentStat.valid++
+			} else {
+				currentStat.invalid++
+			}
+			programWalker.resultTypeStats[r.resourceType] = currentStat
+
+			if quietFlag {
+				continue
+			}
+
+			if !r.isValid || showAllFlag {
+				fmt.Println(r.String())
 			}
 		}
 	})
@@ -147,6 +180,19 @@ func main() {
 	programWalker.validatingLinesDone.Wait()
 	close(results)
 	printerDone.Wait()
+
+	table := tabwriter.NewWriter(os.Stdout, 0, 0, 6, ' ', 0)
+	defer table.Flush()
+	fmt.Fprintln(table, "")
+	fmt.Fprintln(table, fmt.Sprintf("Reference Type\tTotal\tErrors"))
+	writeStatsRow(table, "Markdown file", programWalker.resultTypeStats[markdownFile])
+	writeStatsRow(table, "Image file", programWalker.resultTypeStats[imageFile])
+	writeStatsRow(table, "External URL", programWalker.resultTypeStats[externalUrl])
+	writeStatsRow(table, "Uncategorised", programWalker.resultTypeStats[unknown])
+}
+
+func writeStatsRow(t *tabwriter.Writer, resourceType string, stats stat) {
+	fmt.Fprintln(t, fmt.Sprintf("%s\t%5d\t%6d", resourceType, stats.valid+stats.invalid, stats.invalid))
 }
 
 func (w *walker) processLineUrls(line []byte, path string, lineNumber int, results chan<- result) {
@@ -195,12 +241,19 @@ func (w *walker) validateUrl(urlStr, path string, lineNumber int, results chan<-
 	req.Header.Set("User-Agent", "Walk_The_Doc/v1")
 
 	resp, reqErr := w.httpClient.Do(req)
-	if reqErr != nil {
-		results <- result{link: urlStr, foundInFile: path, foundLineNumber: lineNumber}
-		return
+	isValid := reqErr == nil
+
+	if isValid {
+		resp.Body.Close()
 	}
-	resp.Body.Close()
-	results <- result{isValid: true, link: urlStr, foundInFile: path, foundLineNumber: lineNumber, responseStatusCode: fmt.Sprintf("%d", resp.StatusCode)}
+
+	results <- result{
+		link:            urlStr,
+		foundInFile:     path,
+		foundLineNumber: lineNumber,
+		resourceType:    externalUrl,
+		isValid:         isValid,
+	}
 }
 
 func getLineUrls(line []byte) [][]byte {
@@ -239,31 +292,53 @@ func (w *walker) processLineMarkdownRefs(line []byte, path string, lineNumber in
 		}
 
 		w.validatingLinesDone.Go(func() {
-			// In Jekyll mode, links shouldn't have a .md suffix — Jekyll renders
-			// them as HTML routes. In standard mode, links reference .md files directly
+			fileExtension := filepath.Ext(refStr)
 			fileToCheck := refStr
+			resourceType := unknown
+
+			switch fileExtension {
+			case ".md":
+				resourceType = markdownFile
+			case ".png", ".jpg", ".jpeg", ".gif", ".svg":
+				resourceType = imageFile
+			}
+
+			// In Jekyll mode, links shouldn't have a .md suffix as they are turned into
+			// HTML routes. In standard mode, links reference .md files directly
 			if jekyllModeFlag {
-				if filepath.Ext(refStr) == ".md" {
-					results <- result{isValid: false, link: refStr, foundInFile: path, foundLineNumber: lineNumber}
+				if fileExtension == ".md" {
+					results <- result{
+						isValid:         false,
+						resourceType:    markdownFile,
+						link:            refStr,
+						foundInFile:     path,
+						foundLineNumber: lineNumber,
+					}
 					return
-				} else if filepath.Ext(refStr) == "" {
+				} else if fileExtension == "" {
 					fileToCheck = refStr + ".md"
+					resourceType = markdownFile
 				}
 			}
 
 			_, err := os.Stat(filepath.Join(filepath.Dir(path), fileToCheck))
-			results <- result{isValid: err == nil, link: refStr, foundInFile: path, foundLineNumber: lineNumber}
+			results <- result{
+				resourceType:    resourceType,
+				isValid:         err == nil,
+				link:            refStr,
+				foundInFile:     path,
+				foundLineNumber: lineNumber}
 		})
 	}
 }
 
 func (w *walker) markSeen(key string) bool {
-	w.seenUrlsMu.Lock()
-	defer w.seenUrlsMu.Unlock()
-	if _, seen := w.seenUrls[key]; seen {
+	w.seenResourcesMu.Lock()
+	defer w.seenResourcesMu.Unlock()
+	if _, seen := w.seenResources[key]; seen {
 		return false
 	}
-	w.seenUrls[key] = struct{}{}
+	w.seenResources[key] = struct{}{}
 	return true
 }
 
@@ -306,6 +381,31 @@ func isNonLocalRef(ref []byte) bool {
 		}
 	}
 	return false
+}
+
+func (r *result) String() string {
+	label := ""
+	switch r.resourceType {
+	case markdownFile:
+		label = "[Markdown File]"
+	case imageFile:
+		label = "[Image File]"
+	case externalUrl:
+		label = "[External URL]"
+	default:
+		label = "[Uncategorised]"
+	}
+
+	colour := redAnsi
+	if r.isValid {
+		colour = greenAnsi
+	}
+
+	paddedLabel := formatSgr(fmt.Sprintf("%-15s", label), colour)
+	paddedLink := fmt.Sprintf("%-30s", r.link)
+	lineInfo := formatSgr(fmt.Sprintf("(%s, line %d)", r.foundInFile, r.foundLineNumber), dimAnsi)
+
+	return fmt.Sprintf("%s %s %s", paddedLabel, paddedLink, lineInfo)
 }
 
 func containsLink(line []byte) bool {
