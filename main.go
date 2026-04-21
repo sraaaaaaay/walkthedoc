@@ -95,9 +95,6 @@ func init() {
 	}
 }
 
-// TODO
-// - Rate limiting?
-// - Save successful ones to 24hr cache to reduce spam
 func main() {
 	flag.StringVar(&dirFlag, "d", ".", "(Directory) - directory to search")
 	flag.BoolVar(&showAllFlag, "a", false, "(All) - print all responses")
@@ -231,18 +228,30 @@ func (w *walker) validateUrl(urlStr, path string, lineNumber int, results chan<-
 	sem <- struct{}{}
 	defer func() { <-sem }()
 
-	req, err := http.NewRequest(http.MethodHead, urlStr, nil)
-	if err != nil {
+	headReq, headErr := createRequest(http.MethodHead, urlStr)
+	if headErr != nil {
 		return
 	}
 
-	req.Header.Set("User-Agent", "Walk_The_Doc/v1")
+	isValid := false
+	headResp, headReqErr := w.httpClient.Do(headReq)
+	if headReqErr == nil {
+		isValid = true
+		headResp.Body.Close()
+	}
 
-	resp, reqErr := w.httpClient.Do(req)
-	isValid := reqErr == nil
+	// Although rare, some sites might block HEAD requests.
+	// If we get a 405, try sending a fallback GET instead.
+	if isValid && headResp.StatusCode == http.StatusMethodNotAllowed {
+		getReq, getErr := createRequest(http.MethodGet, urlStr)
+		if getErr != nil {
+			return
+		}
 
-	if isValid {
-		resp.Body.Close()
+		getResp, getReqErr := w.httpClient.Do(getReq)
+		if getReqErr == nil {
+			getResp.Body.Close()
+		}
 	}
 
 	results <- result{
@@ -252,6 +261,15 @@ func (w *walker) validateUrl(urlStr, path string, lineNumber int, results chan<-
 		resourceType:    externalUrl,
 		isValid:         isValid,
 	}
+}
+
+func createRequest(method, to string) (*http.Request, error) {
+	req, err := http.NewRequest(method, to, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "Walk_The_Doc/v1")
+	return req, nil
 }
 
 func getLineUrls(line []byte) [][]byte {
