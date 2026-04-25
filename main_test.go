@@ -1,6 +1,8 @@
 package main
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -226,5 +228,44 @@ func TestGetLineMarkdownRefs_IgnoresNonLocal(t *testing.T) {
 	}
 	if string(refs[0]) != "local.md" {
 		t.Errorf("found a reference to %q, but wanted %q", refs[0], "local.md")
+	}
+}
+
+func TestValidateUrl_FallbackToGet_OnHead405(t *testing.T) {
+	// Arrange
+	numHead := 0
+	numGet := 0
+	testServer := httptest.NewServer(
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodHead {
+				numHead++
+				w.WriteHeader(http.StatusMethodNotAllowed)
+			}
+
+			if r.Method == http.MethodGet {
+				numGet++
+				w.WriteHeader(http.StatusOK)
+			}
+		}))
+	defer testServer.Close()
+
+	w := walker{
+		httpClient:       *http.DefaultClient,
+		perHostSemaphore: make(map[string]chan struct{}),
+		seenResources:    make(map[string]struct{}),
+	}
+
+	results := make(chan result, 1)
+
+	// Act
+	w.validateUrl("fake.md", testServer.URL, 1, results)
+
+	// Assert
+	_, ok := <-results
+	if !ok {
+		t.Fatal("expected a result from the channel")
+	}
+	if !(numGet == 1 && numHead == 1) {
+		t.Fatal("expected server to receive one HEAD and one GET request")
 	}
 }
