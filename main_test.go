@@ -18,6 +18,12 @@ type validityTestCase struct {
 	wantValid  bool
 }
 
+type httpTestCase struct {
+	name      string
+	status    int
+	wantValid bool
+}
+
 func TestGetLineUrls(t *testing.T) {
 	// Arrange
 	tests := []parsingTestCase{
@@ -231,7 +237,7 @@ func TestGetLineMarkdownRefs_IgnoresNonLocal(t *testing.T) {
 	}
 }
 
-func TestValidateUrl_FallbackToGet_OnHead405(t *testing.T) {
+func TestValidateUrl_Head405IsValid(t *testing.T) {
 	// Arrange
 	numHead := 0
 	numGet := 0
@@ -261,11 +267,57 @@ func TestValidateUrl_FallbackToGet_OnHead405(t *testing.T) {
 	w.validateUrl("fake.md", testServer.URL, 1, results)
 
 	// Assert
-	_, ok := <-results
+	r, ok := <-results
 	if !ok {
 		t.Fatal("expected a result from the channel")
 	}
-	if !(numGet == 1 && numHead == 1) {
-		t.Fatal("expected server to receive one HEAD and one GET request")
+	if numHead != 1 {
+		t.Errorf("expected 1 HEAD request, got %d", numHead)
+	}
+	if numGet != 0 {
+		t.Errorf("expected 0 GET requests, got %d", numGet)
+	}
+	if !r.isValid {
+		t.Error("HEAD 405 should be treated as valid")
+	}
+}
+
+func TestValidateUrl_StatusGating(t *testing.T) {
+	// Arrange
+	tests := []httpTestCase{
+		{name: "200 OK is valid", status: http.StatusOK, wantValid: true},
+		{name: "403 Forbidden is valid", status: http.StatusForbidden, wantValid: true},                       // could be anti-bot
+		{name: "500 Internal Server Error is valid", status: http.StatusInternalServerError, wantValid: true}, // could be transient
+		{name: "404 Not Found is invalid", status: http.StatusNotFound, wantValid: false},                     // definitely invalid
+		{name: "410 Gone is invalid", status: http.StatusGone, wantValid: false},                              // definitely invalid
+	}
+
+	// Act
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			testServer := httptest.NewServer(
+				http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.WriteHeader(testCase.status)
+				}))
+			defer testServer.Close()
+
+			w := walker{
+				httpClient:       *http.DefaultClient,
+				perHostSemaphore: make(map[string]chan struct{}),
+				seenResources:    make(map[string]struct{}),
+			}
+			results := make(chan result, 1)
+
+			w.validateUrl("fake.md", testServer.URL, 1, results)
+
+			// Assert
+			r, ok := <-results
+			if !ok {
+				t.Fatal("expected a result from the channel")
+			}
+			if r.isValid != testCase.wantValid {
+				t.Errorf("status %d: validity was %v, but wanted %v", testCase.status, r.isValid, testCase.wantValid)
+			}
+		})
 	}
 }

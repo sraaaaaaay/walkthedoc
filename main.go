@@ -200,7 +200,7 @@ func (w *walker) processLineUrls(currentFile string, line []byte, lineNumber int
 		}
 
 		w.validatingLinesDone.Go(func() {
-			w.validateUrl(urlStr, currentFile, lineNumber, results)
+			w.validateUrl(currentFile, urlStr, lineNumber, results)
 		})
 	}
 }
@@ -236,22 +236,12 @@ func (w *walker) validateUrl(currentFile, foundUrl string, lineNumber int, resul
 	isValid := false
 	headResp, headReqErr := w.httpClient.Do(headReq)
 	if headReqErr == nil {
-		isValid = true
+		// Treat any reachable host as valid. Transient 400-500
+		// errors might not happen in a browser, so avoid false
+		// positives. 404/410 are exceptions as we know with some
+		// certainty that the resource really isn't there.
+		isValid = headResp.StatusCode != http.StatusNotFound && headResp.StatusCode != http.StatusGone
 		headResp.Body.Close()
-	}
-
-	// Although rare, some sites might block HEAD requests.
-	// If we get a 405, try sending a fallback GET instead.
-	if isValid && headResp.StatusCode == http.StatusMethodNotAllowed {
-		getReq, getErr := createRequest(http.MethodGet, foundUrl)
-		if getErr != nil {
-			return
-		}
-
-		getResp, getReqErr := w.httpClient.Do(getReq)
-		if getReqErr == nil {
-			getResp.Body.Close()
-		}
 	}
 
 	results <- result{
