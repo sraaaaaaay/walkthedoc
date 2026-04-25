@@ -52,6 +52,9 @@ const (
 
 const (
 	maxActiveReqsPerHost = 4
+	redRgb               = "240;110;120"
+	greenRgb             = "120;200;75"
+	dimRgb               = "137;137;137"
 )
 
 var (
@@ -69,10 +72,7 @@ var (
 		seenResources:    make(map[string]struct{}),
 	}
 
-	redAnsi   = 31
-	greenAnsi = 32
-	dimAnsi   = 2
-	urlTable  [256]bool
+	urlTable [256]bool
 
 	dirFlag        string
 	showAllFlag    bool
@@ -400,14 +400,14 @@ func (r *result) String() string {
 		label = "[Uncategorised]"
 	}
 
-	colour := redAnsi
+	colour := redRgb
 	if r.isValid {
-		colour = greenAnsi
+		colour = greenRgb
 	}
 
 	paddedLabel := formatSgr(fmt.Sprintf("%-15s", label), colour)
 	paddedLink := fmt.Sprintf("%-30s", r.link)
-	lineInfo := formatSgr(fmt.Sprintf("(%s, line %d)", r.foundInFile, r.foundLineNumber), dimAnsi)
+	lineInfo := formatSgr(fmt.Sprintf("(%s, line %d)", r.foundInFile, r.foundLineNumber), dimRgb)
 
 	return fmt.Sprintf("%s %s %s", paddedLabel, paddedLink, lineInfo)
 }
@@ -425,6 +425,6 @@ func findUrlEnd(s []byte) int {
 	return len(s)
 }
 
-func formatSgr(s string, ansiColour int) string {
-	return fmt.Sprintf("%c[%dm%s%c[0m", 0x1b, ansiColour, s, 0x1b)
+func formatSgr(s string, ansiRgb string) string {
+	return fmt.Sprintf("%c[38;2;%sm%s%c[0m", 0x1b, ansiRgb, s, 0x1b)
 }
