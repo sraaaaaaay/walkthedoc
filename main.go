@@ -90,7 +90,7 @@ var (
 
 func init() {
 	// Populate a lookup table with bytes for common link terminators (whitespace, brackets, etc)
-	for _, c := range []byte(" \t\n\r\"'<>,()") {
+	for _, c := range []byte(" \t\n\r\"'<>,()[]") {
 		urlTable[c] = true
 	}
 }
@@ -164,10 +164,10 @@ func main() {
 			}
 
 			if checkUrlsFlag {
-				programWalker.processLineUrls(line, path, lineNumber, results)
+				programWalker.processLineUrls(path, line, lineNumber, results)
 			}
 
-			programWalker.processLineMarkdownRefs(line, path, lineNumber, results)
+			programWalker.processLineMarkdownRefs(path, line, lineNumber, results)
 		}
 		return nil
 	})
@@ -190,7 +190,7 @@ func writeStatsRow(t *tabwriter.Writer, resourceType string, stats stat) {
 	fmt.Fprintln(t, fmt.Sprintf("%s\t%5d\t%6d", resourceType, stats.valid+stats.invalid, stats.invalid))
 }
 
-func (w *walker) processLineUrls(line []byte, path string, lineNumber int, results chan<- result) {
+func (w *walker) processLineUrls(currentFile string, line []byte, lineNumber int, results chan<- result) {
 	urlLinks := getLineUrls(line)
 	for _, urlBytes := range urlLinks {
 		// Mark the URL as seen
@@ -200,13 +200,13 @@ func (w *walker) processLineUrls(line []byte, path string, lineNumber int, resul
 		}
 
 		w.validatingLinesDone.Go(func() {
-			w.validateUrl(urlStr, path, lineNumber, results)
+			w.validateUrl(urlStr, currentFile, lineNumber, results)
 		})
 	}
 }
 
-func (w *walker) validateUrl(urlStr, path string, lineNumber int, results chan<- result) {
-	parsedUrl, parseErr := url.Parse(urlStr)
+func (w *walker) validateUrl(currentFile, foundUrl string, lineNumber int, results chan<- result) {
+	parsedUrl, parseErr := url.Parse(foundUrl)
 	if parseErr != nil {
 		return
 	}
@@ -228,7 +228,7 @@ func (w *walker) validateUrl(urlStr, path string, lineNumber int, results chan<-
 	sem <- struct{}{}
 	defer func() { <-sem }()
 
-	headReq, headErr := createRequest(http.MethodHead, urlStr)
+	headReq, headErr := createRequest(http.MethodHead, foundUrl)
 	if headErr != nil {
 		return
 	}
@@ -243,7 +243,7 @@ func (w *walker) validateUrl(urlStr, path string, lineNumber int, results chan<-
 	// Although rare, some sites might block HEAD requests.
 	// If we get a 405, try sending a fallback GET instead.
 	if isValid && headResp.StatusCode == http.StatusMethodNotAllowed {
-		getReq, getErr := createRequest(http.MethodGet, urlStr)
+		getReq, getErr := createRequest(http.MethodGet, foundUrl)
 		if getErr != nil {
 			return
 		}
@@ -255,8 +255,8 @@ func (w *walker) validateUrl(urlStr, path string, lineNumber int, results chan<-
 	}
 
 	results <- result{
-		link:            urlStr,
-		foundInFile:     path,
+		link:            foundUrl,
+		foundInFile:     currentFile,
 		foundLineNumber: lineNumber,
 		resourceType:    externalUrl,
 		isValid:         isValid,
@@ -299,7 +299,7 @@ func getLineUrls(line []byte) [][]byte {
 	return links
 }
 
-func (w *walker) processLineMarkdownRefs(line []byte, path string, lineNumber int, results chan<- result) {
+func (w *walker) processLineMarkdownRefs(currentFile string, line []byte, lineNumber int, results chan<- result) {
 	mdLinks := getLineMarkdownRefs(line)
 	for _, refBytes := range mdLinks {
 		refStr := string(refBytes)
@@ -309,27 +309,29 @@ func (w *walker) processLineMarkdownRefs(line []byte, path string, lineNumber in
 
 		w.validatingLinesDone.Go(func() {
 			ext := filepath.Ext(refStr)
-			fileToCheck := refStr
-			resourceType := unknown
+			referencedFileName := refStr
+			referencedResourceType := unknown
 
 			switch ext {
 			case ".md":
-				resourceType = markdownFile
+				referencedResourceType = markdownFile
 			case ".png", ".jpg", ".jpeg", ".gif", ".svg":
-				resourceType = imageFile
+				referencedResourceType = imageFile
 			}
 
+			// If we found "foo" in Jekyll mode, test if the file foo.md exists.
+			// If we found "foo.md" in Jekyll mode, it's invalid, so just test foo.md.md to fail it.
 			if jekyllModeFlag && (ext == "" || ext == ".md") {
-				fileToCheck = refStr + ".md"
-				resourceType = markdownFile
+				referencedFileName = refStr + ".md"
+				referencedResourceType = markdownFile
 			}
 
-			_, err := os.Stat(filepath.Join(filepath.Dir(path), fileToCheck))
+			_, err := os.Stat(filepath.Join(filepath.Dir(currentFile), referencedFileName))
 			results <- result{
 				link:            refStr,
-				foundInFile:     path,
+				foundInFile:     currentFile,
 				foundLineNumber: lineNumber,
-				resourceType:    resourceType,
+				resourceType:    referencedResourceType,
 				isValid:         err == nil,
 			}
 		})
