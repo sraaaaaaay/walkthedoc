@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"text/tabwriter"
@@ -184,6 +185,19 @@ func main() {
 	writeStatsRow(table, "Image file", programWalker.resultTypeStats[imageFile])
 	writeStatsRow(table, "External URL", programWalker.resultTypeStats[externalUrl])
 	writeStatsRow(table, "Uncategorised", programWalker.resultTypeStats[unknown])
+
+	if checkUrlsFlag {
+		hostNames := make([]string, len(programWalker.perHostSemaphore))
+		i := 0
+		for key, _ := range programWalker.perHostSemaphore {
+			hostNames[i] = key
+			i++
+		}
+		sort.Strings(hostNames)
+		fmt.Fprintln(table, "")
+		fmt.Fprintln(table, "Checked hostnames:", hostNames)
+	}
+
 }
 
 func writeStatsRow(t *tabwriter.Writer, resourceType string, stats stat) {
