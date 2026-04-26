@@ -113,6 +113,7 @@ func main() {
 	// and print them out as they arrive.
 	results := make(chan result, 64)
 	var printerDone sync.WaitGroup
+	allValid := true
 	printerDone.Go(func() {
 		currentStat := stat{}
 		for r := range results {
@@ -121,6 +122,7 @@ func main() {
 			if r.isValid {
 				currentStat.valid++
 			} else {
+				allValid = false
 				currentStat.invalid++
 			}
 			programWalker.resultTypeStats[r.resourceType] = currentStat
@@ -198,6 +200,9 @@ func main() {
 		fmt.Fprintln(table, "Checked hostnames:", hostNames)
 	}
 
+	if !allValid {
+		os.Exit(1)
+	}
 }
 
 func writeStatsRow(t *tabwriter.Writer, resourceType string, stats stat) {
