@@ -1,0 +1,9 @@
+{
+  "name": "walkthedoc",
+  "description": "Simple commandline tool to verify file links, images and external URLs in Markdown files",
+  "version": "1.0.0",
+  "author": {
+    "name": "sraaaaaaay",
+    "url": "https://github.com/sraaaaaaay"
+  }
+}

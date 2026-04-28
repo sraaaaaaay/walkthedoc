@@ -1,0 +1,16 @@
+{
+  "name": "walkthedoc",
+  "description": "Run a command within a directory to check Markdown files for broken links and dead URLs",
+  "owner": {
+    "name": "sraaaaaaay",
+    "url": "https://github.com/sraaaaaaay"
+  },
+  "plugins": [
+    {
+      "name": "walkthedoc",
+      "source": "./",
+      "description": "Check a collection of Markdown files for dead links, images and URLs",
+      "category": "documentation"
+    }
+  ]
+}
